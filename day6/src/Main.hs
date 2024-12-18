@@ -9,7 +9,7 @@ import Data.List (find, intercalate)
 import Data.Set (Set, empty, insert, member)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitSuccess)
-import System.IO (hReady, stdin)
+import System.IO (BufferMode (NoBuffering), hReady, hSetBuffering, hSetEcho, stdin)
 
 data Pos = Pos {x :: Int, y :: Int}
     deriving (Eq, Ord, Read, Show)
@@ -20,10 +20,14 @@ data Orientation = N | E | S | W
 data Guard = Guard {pos :: Pos, orientation :: Orientation}
     deriving (Eq, Ord, Read, Show)
 
+data StopCondition = Loop | OutOfBounds | Quit | Continue
+    deriving (Eq, Ord, Read, Show)
+
 data Grid = Grid
     { guard :: Guard
     , obstacles :: Set Pos
-    , visited :: Set Pos
+    , visitedCells :: Set Pos
+    , visitedObstacles :: Set (Pos, Orientation)
     , bounds :: (Int, Int)
     }
     deriving (Eq, Ord)
@@ -36,7 +40,7 @@ instance Show Grid where
         pointStr p
             | p == pos (guard g) = printGuard (guard g)
             | member p (obstacles g) = "#"
-            | member p (visited g) = "X"
+            | member p (visitedCells g) = "X"
             | otherwise = "."
         rowStr y = intercalate "" [pointStr (Pos{x, y}) | x <- [0 .. (width - 1)]]
         gridStr = unlines [rowStr y | y <- [0 .. (height - 1)]]
@@ -46,7 +50,8 @@ emptyGridWithBounds width height =
     Grid
         { guard = Guard{pos = Pos{x = 0, y = 0}, orientation = N}
         , obstacles = empty
-        , visited = empty
+        , visitedCells = empty
+        , visitedObstacles = empty
         , bounds = (width, height)
         }
 
@@ -65,12 +70,12 @@ tryReadGrid input = foldM readGridChar startingGrid rowsWithPos
 
 readGridChar :: Grid -> (Char, Pos) -> Either (Pos, String) Grid
 readGridChar g (c, p) = case c of
-    '^' -> return $ g{guard = Guard{pos = p, orientation = N}, visited = insert p (visited g)}
-    '>' -> return $ g{guard = Guard{pos = p, orientation = E}, visited = insert p (visited g)}
-    'V' -> return $ g{guard = Guard{pos = p, orientation = S}, visited = insert p (visited g)}
-    '<' -> return $ g{guard = Guard{pos = p, orientation = W}, visited = insert p (visited g)}
+    '^' -> return $ g{guard = Guard{pos = p, orientation = N}, visitedCells = insert p (visitedCells g)}
+    '>' -> return $ g{guard = Guard{pos = p, orientation = E}, visitedCells = insert p (visitedCells g)}
+    'V' -> return $ g{guard = Guard{pos = p, orientation = S}, visitedCells = insert p (visitedCells g)}
+    '<' -> return $ g{guard = Guard{pos = p, orientation = W}, visitedCells = insert p (visitedCells g)}
     '#' -> return $ g{obstacles = insert p (obstacles g)}
-    'X' -> return $ g{visited = insert p (visited g)}
+    'X' -> return $ g{visitedCells = insert p (visitedCells g)}
     '.' -> return $ g
     _ -> Left (p, "invalid character " ++ [c])
 
@@ -94,32 +99,34 @@ nextPos Guard{pos = Pos{x, y}, orientation = E} = Pos{x = x + 1, y}
 nextPos Guard{pos = Pos{x, y}, orientation = S} = Pos{x, y = y + 1}
 nextPos Guard{pos = Pos{x, y}, orientation = W} = Pos{x = x - 1, y}
 
-moveGuard :: Guard -> Set Pos -> Guard
-moveGuard g obstacles =
-    let p = nextPos g
-     in if member p obstacles
-            -- same position, rotate 90 degrees to the guard's right
-            then Guard{pos = pos g, orientation = rotateRight (orientation g)}
-            -- otherwise move forward one position
-            else Guard{pos = p, orientation = orientation g}
+getNextGrid :: Grid -> Either StopCondition Grid
+getNextGrid grid
+    -- a loop occurs when we hit an obstacle again with the same orientation as previously seen
+    | member (p, dir) visitedObs = Left Loop
+    -- stop when out of the grid bounds
+    | outOfBounds p (bounds grid) = Left OutOfBounds
+    -- same position, rotate 90 degrees to the guard's right
+    | member p obs = Right grid{guard = g{orientation = rotateRight dir}, visitedObstacles = insert (p, dir) visitedObs}
+    -- otherwise move forward one position
+    | otherwise = Right grid{guard = g{pos = p}, visitedCells = insert p (visitedCells grid)}
+  where
+    g = guard grid
+    dir = orientation g
+    obs = obstacles grid
+    visitedObs = visitedObstacles grid
+    p = nextPos g
 
-outOfBounds :: Pos -> (Int, Int) -> Bool
-outOfBounds Pos{x, y} (width, height) = x < 0 || x >= width || y < 0 || y >= height
+    outOfBounds :: Pos -> (Int, Int) -> Bool
+    outOfBounds Pos{x, y} (width, height) = x < 0 || x >= width || y < 0 || y >= height
 
-moveOne :: (Monad m) => StateT Grid m Bool
+moveOne :: (Monad m) => StateT Grid m StopCondition
 moveOne = do
     grid <- get
-    let g = guard grid
-    let ng = moveGuard g $ obstacles grid
-    let stop = outOfBounds (pos ng) $ bounds grid
-    put $
-        ( if stop
-            then grid
-            else grid{guard = ng, visited = insert (pos ng) $ visited grid}
-        )
-    return stop
+    let nextGrid = getNextGrid grid
+    put $ either (const grid) id nextGrid
+    return $ either id (const Continue) nextGrid
 
-moveAll :: (Monad m) => m Bool -> (Grid -> m a) -> StateT Grid m a
+moveAll :: (Monad m) => m Bool -> (Grid -> m a) -> StateT Grid m (StopCondition, a)
 moveAll getContinue doWrite = do
     start <- lift $ getContinue
     if start then executeContinue else executeStop
@@ -129,11 +136,12 @@ moveAll getContinue doWrite = do
         g <- get
         a <- lift $ doWrite g
         case stop of
-            False -> moveAll getContinue doWrite
-            True -> return a
+            Continue -> moveAll getContinue doWrite
+            cond -> return (cond, a)
     executeStop = do
         g <- get
-        lift $ doWrite g
+        a <- lift $ doWrite g
+        return (Quit, a)
 
 -- https://stackoverflow.com/a/38553473
 getKey :: IO String
@@ -144,21 +152,28 @@ getKey = reverse <$> getKey' ""
         more <- hReady stdin
         (if more then getKey' else return) (char : chars)
 
+strip :: [Char] -> [Char]
+strip = lstrip . rstrip
+lstrip :: [Char] -> [Char]
+lstrip = dropWhile (`elem` " \t\r\n")
+rstrip :: [Char] -> [Char]
+rstrip = reverse . lstrip . reverse
+
 getMoveKey :: IO Bool
 getMoveKey = do
     key <- getKey
-    return $ not $ elem key ["\ESC", "q"]
+    return $ not $ elem (strip key) ["\ESC", "q"]
 
-moveAllInteractive :: StateT Grid IO ()
+moveAllInteractive :: StateT Grid IO (StopCondition, ())
 moveAllInteractive = moveAll getMoveKey (putStrLn . show)
 
-moveAllImmediate :: (Monad m) => StateT Grid m ()
+moveAllImmediate :: StateT Grid IO (StopCondition, ())
 moveAllImmediate = moveAll (return True) (\_ -> return ())
 
 getVisitedCount :: (Monad m) => StateT Grid m Int
 getVisitedCount = do
     g <- get
-    return $ length $ visited g
+    return $ length $ visitedCells g
 
 getInputStr :: Maybe String -> Bool -> IO String
 getInputStr = \case
@@ -179,6 +194,11 @@ main = do
     let interactive = (elem "--interactive" args) || (elem "-i" args)
     input <- getInputStr file interactive
     let grid = tryReadGrid input
+
+    -- don't echo keystrokes and don't wait for newlines when reading keys
+    hSetBuffering stdin NoBuffering
+    hSetEcho stdin False
+
     let moveFn = if interactive then moveAllInteractive else moveAllImmediate
     case grid of
         Left (pos, err) -> do
@@ -186,7 +206,15 @@ main = do
             exitFailure
         Right g -> do
             putStrLn $ show g
-            count <- evalStateT (moveFn >> getVisitedCount) g
+            (stopReason, count) <-
+                evalStateT
+                    ( do
+                        (reason, _) <- moveFn
+                        count <- getVisitedCount
+                        return (reason, count)
+                    )
+                    g
+            putStrLn $ "stop reason: " ++ (show stopReason)
             putStrLn $ "visited count: " ++ (show count)
             exitSuccess
   where
