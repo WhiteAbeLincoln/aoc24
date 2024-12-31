@@ -4,15 +4,11 @@ module Main where
 import System.Environment (getArgs)
 import Data.List (find)
 
-data Op = Add | Mul
+data Op = Add | Mul | Concat
   deriving (Eq, Ord, Read, Show)
 
 data OpTree = Cons Op OpTree Int | First Int
   deriving (Eq, Ord, Read, Show)
-
-empty :: Num a => Op -> a
-empty Add = 0
-empty Mul = 1
 
 parseEqn :: String -> (Int, [Int])
 parseEqn text =
@@ -25,10 +21,11 @@ parseEqn text =
 pairs :: [b] -> [(b, b)]
 pairs lst = zip lst (drop 1 lst)
 
+-- a left fold with multiple options, using the list monad
 applyOps :: OpTree -> [Int] -> [OpTree]
 applyOps z [] = [z]
 applyOps z (x:xs) = do
-    op <- [Add, Mul]
+    op <- [Add, Mul, Concat]
     let t = Cons op z x
     applyOps t xs
 
@@ -41,6 +38,9 @@ evalOps (First x) = x
 evalOps (Cons op tree y) = case op of
     Add -> evalOps tree + y
     Mul -> evalOps tree * y
+    -- printing to a string and reading is a hack
+    -- but easier than the log-based concatenation
+    Concat -> read $ (show $ evalOps tree) ++ (show y)
 
 getTestOps :: (Int, [Int]) -> Int
 getTestOps (result, inputs) =
