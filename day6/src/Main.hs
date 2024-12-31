@@ -3,10 +3,10 @@
 module Main where
 
 import Control.Monad (foldM)
-import Control.Monad.State (StateT, evalStateT, get, lift, put)
+import Control.Monad.State (StateT, evalStateT, get, lift, put, runStateT)
 import Data.Either ()
 import Data.List (find, intercalate)
-import Data.Set (Set, empty, insert, member)
+import Data.Set (Set, elems, empty, insert, member)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitSuccess)
 import System.IO (BufferMode (NoBuffering), hReady, hSetBuffering, hSetEcho, stdin)
@@ -143,6 +143,17 @@ moveAll getContinue doWrite = do
         a <- lift $ doWrite g
         return (Quit, a)
 
+getObstacleGrids :: Guard -> Grid -> [Grid]
+getObstacleGrids origGuard grid =
+    (gridWithObs . addObstacle) <$> (elems $ visitedCells grid)
+  where
+    gridWithObs obs =
+        grid{guard = origGuard, obstacles = obs, visitedCells = empty, visitedObstacles = empty}
+    addObstacle p =
+        if p == pos origGuard
+            then obstacles grid
+            else insert p (obstacles grid)
+
 -- https://stackoverflow.com/a/38553473
 getKey :: IO String
 getKey = reverse <$> getKey' ""
@@ -206,8 +217,8 @@ main = do
             exitFailure
         Right g -> do
             putStrLn $ show g
-            (stopReason, count) <-
-                evalStateT
+            ((stopReason, count), final) <-
+                runStateT
                     ( do
                         (reason, _) <- moveFn
                         count <- getVisitedCount
@@ -216,8 +227,16 @@ main = do
                     g
             putStrLn $ "stop reason: " ++ (show stopReason)
             putStrLn $ "visited count: " ++ (show count)
+            -- now compute the possible loops. This is handled
+            -- by creating new grids with one obstacle inserted for
+            -- each of the visited positions (aside from the guard's initial position)
+            let altGrids = getObstacleGrids (guard g) final
+            altReasons <- sequence $ fmap (evalStateT $ fst <$> moveAllImmediate) altGrids
+            putStrLn $ "loop count: " ++ (show $ sumLoops altReasons)
             exitSuccess
   where
+    sumLoops :: [StopCondition] -> Int
+    sumLoops = foldr (\s -> (+ (if s == Loop then 1 else 0))) 0
     findInputFile args =
         let
             pair = find (\(f, _) -> f == "-f" || f == "--file") pairs
